@@ -14,14 +14,21 @@ import (
 // mode, errors are not returned from SendMessage, but over the Errors()
 // channel.
 type ProducerConfig struct {
-	Partitioner      Partitioner          // Chooses the partition to send messages to, or randomly if this is nil.
-	RequiredAcks     RequiredAcks         // The level of acknowledgement reliability needed from the broker (defaults to WaitForLocal).
-	Timeout          time.Duration        // The maximum duration the broker will wait the receipt of the number of RequiredAcks. This is only relevant when RequiredAcks is set to WaitForAll or a number > 1. Only supports millisecond resolution, nanoseconds will be truncated.
-	Compression      CompressionCodec     // The type of compression to use on messages (defaults to no compression).
-	MaxBufferedBytes uint32               // The maximum number of bytes to buffer per-broker before sending to Kafka.
-	MaxBufferTime    time.Duration        // The maximum duration to buffer messages before sending to a broker.
+	Partitioner  Partitioner  // Chooses the partition to send messages to, or randomly if this is nil.
+	RequiredAcks RequiredAcks // The level of acknowledgement reliability needed from the broker (defaults to WaitForLocal).
+	// The maximum duration the broker will wait the receipt of the number of RequiredAcks.
+	// This is only relevant when RequiredAcks is set to WaitForAll or a number > 1.
+	// Only supports millisecond resolution, nanoseconds will be truncated.
+	Timeout time.Duration
+	Compression      CompressionCodec // The type of compression to use on messages (defaults to no compression).
+	MaxBufferedBytes uint32           // The threshold number of bytes buffered before triggering a flush to the broker.
+	MaxBufferTime    time.Duration    // The maximum duration to buffer messages before triggering a flush to the broker.
 	Failures         chan *ConsumerEvent  // Messages that could not be successfully acked will be sent on this channel. If supplied you *must* read the values from the channel.  It is advised but not required to use a buffered channel.
 	Acks             chan map[int32]int64 // Counts per partition for each topic of acked messages will be sent on this channel after a flush. If supplied you *must* read the values from the channel.  It is advised but not required to use a buffered channel.
+	// The maximum number of bytes allowed to accumulare in the buffer before back-pressure is applied to QueueMessage.
+	// Without this, queueing messages too fast will cause the producer to construct requests larger than the MaxRequestSize.
+	// Defaults to 50 MiB, cannot be more than (MaxRequestSize - 10 KiB).
+	BackPressureThresholdBytes uint32
 }
 
 // Producer publishes Kafka messages. It routes messages to the correct broker
@@ -179,7 +186,7 @@ func (p *Producer) addMessage(msg *produceMessage) error {
 	if err != nil {
 		return err
 	}
-	bp.addMessage(msg, p.config.MaxBufferedBytes)
+	bp.addMessage(msg, p.config.MaxBufferedBytes, p.config.BackPressureThresholdBytes)
 	return nil
 }
 
@@ -252,7 +259,7 @@ func (p *Producer) newBrokerProducer(broker *Broker) *brokerProducer {
 	return bp
 }
 
-func (bp *brokerProducer) addMessage(msg *produceMessage, maxBufferBytes uint32) {
+func (bp *brokerProducer) addMessage(msg *produceMessage, maxBufferBytes, backPressureThreshold uint32) {
 	bp.mapM.Lock()
 	if msg.retried {
 		// Prepend: Deliver first, before any more recently-added messages.
@@ -269,14 +276,18 @@ func (bp *brokerProducer) addMessage(msg *produceMessage, maxBufferBytes uint32)
 	}
 
 	bp.mapM.Unlock()
-	bp.flushIfOverCapacity(maxBufferBytes)
+	bp.flushIfOverCapacity(maxBufferBytes, backPressureThreshold)
 }
 
-func (bp *brokerProducer) flushIfOverCapacity(maxBufferBytes uint32) {
+func (bp *brokerProducer) flushIfOverCapacity(maxBufferBytes, backPressureThreshold uint32) {
 	bp.mapM.Lock()
-	over := bp.bufferedBytes > maxBufferBytes
+	softlimit := bp.bufferedBytes > maxBufferBytes
+	hardlimit := bp.bufferedBytes > backPressureThreshold
 	bp.mapM.Unlock()
-	if over {
+
+	if hardlimit {
+		bp.flushNow <- true
+	} else if softlimit {
 		select {
 		case bp.flushNow <- true:
 		default:
@@ -354,6 +365,7 @@ func (bp *brokerProducer) flushRequest(p *Producer, prb produceRequestBuilder, e
 		errorCb(err)
 		return false
 	default:
+		p.client.disconnectBroker(bp.broker)
 		overlimit := 0
 		prb.reverseEach(func(msg *produceMessage) {
 			if err := msg.reenqueue(p); err != nil {
@@ -495,10 +507,11 @@ func (p *Producer) choosePartition(topic string, key Encoder) (int32, error) {
 // NewProducerConfig creates a new ProducerConfig instance with sensible defaults.
 func NewProducerConfig() *ProducerConfig {
 	return &ProducerConfig{
-		Partitioner:      NewRandomPartitioner(),
-		RequiredAcks:     WaitForLocal,
-		MaxBufferTime:    1 * time.Millisecond,
-		MaxBufferedBytes: 1,
+		Partitioner:                NewRandomPartitioner(),
+		RequiredAcks:               WaitForLocal,
+		MaxBufferTime:              1 * time.Millisecond,
+		MaxBufferedBytes:           1,
+		BackPressureThresholdBytes: 50 * 1024 * 1024,
 	}
 }
 
@@ -525,6 +538,14 @@ func (config *ProducerConfig) Validate() error {
 
 	if config.Partitioner == nil {
 		return ConfigurationError("No partitioner set")
+	}
+
+	if config.BackPressureThresholdBytes < config.MaxBufferedBytes {
+		return ConfigurationError("BackPressureThresholdBytes cannot be less than MaxBufferedBytes")
+	}
+
+	if config.BackPressureThresholdBytes > MaxRequestSize-10*1024 {
+		return ConfigurationError("BackPressureThresholdBytes must be at least 10KiB less than MaxRequestSize")
 	}
 
 	return nil
